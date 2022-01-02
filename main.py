@@ -253,7 +253,6 @@ class SessionManager:
 
     def delete(self, s_id: UUID):
         self.sessions.pop(s_id)
-        ee.off(str(s_id))
 
     def gc(self) -> GCResult:
         result = GCResult()
@@ -344,15 +343,25 @@ class EventEmitter:
         self.logger.setLevel(logging.DEBUG)
         self.channels = {}
 
-    def on(self, e: str) -> asyncio.Queue:
+    @contextmanager
+    def subscription(self, e: str):
         if e not in self.channels:
             self.channels[e] = set()
         chan = asyncio.Queue()
         self.channels[e].add(chan)
-        return chan
+        self.logger.debug(f"Subscribed on {e!r}")
 
-    def off(self, e: str):
-        self.channels.pop(e)
+        async def chan_iter():
+            while True:
+                yield await chan.get()
+
+        try:
+            yield chan_iter()
+        finally:
+            self.logger.debug(f"Unsubscribed from {e!r}")
+            self.channels[e].remove(chan)
+            if len(self.channels[e]) == 0:
+                self.channels.pop(e)
 
     def emit(self, e: str, data: typing.Any = None):
         for chan in self.channels.get(e, set()):
@@ -384,39 +393,43 @@ player_name_regex: typing.Final[regex.Regex] = regex.compile(r"\w{1,10}")
 async def join_session(s_id: UUID, p_id: str):
     SESSION_EVENT: typing.Final[str] = str(s_id)
 
+    async def send_json(payload):
+        await with_timeout(websocket.send_json(payload))
+
+    async def send_error(e: Exception):
+        await send_json(str(e))
+
+    async def recv_json():
+        return await with_timeout(websocket.receive_json())
+
     try:
         session = sm.get(s_id)
 
         if not player_name_regex.match(p_id):
-            await with_timeout(
-                websocket.send_json({"error": "Invalid player name format"})
-            )
+            await send_json({"error": "Invalid player name format"})
+            return
 
-        with session.activate_player(p_id):
-            chan = ee.on(SESSION_EVENT)
+        with session.activate_player(p_id), ee.subscription(SESSION_EVENT) as chan:
             ee.emit(SESSION_EVENT)
 
             async def sender():
-                while True:
-                    await chan.get()
+                async for _ in chan:
                     try:
                         logger.debug(f"Sending data to player {p_id!r}")
-                        await with_timeout(
-                            websocket.send_json(
-                                {
-                                    "you": p_id,
-                                    "state": session.game.state,
-                                    "your_turn": session.is_players_turn(p_id),
-                                    "your_sign": session.get_players_sign(p_id).value,
-                                    "game_over": session.game.game_over,
-                                    "winner": session.game.winner.value,
-                                    "active_players": [
-                                        {"name": p.name, "sign": p.sign.value}
-                                        for p in session.players.values()
-                                        if p.name in session.active_players
-                                    ],
-                                }
-                            )
+                        await send_json(
+                            {
+                                "you": p_id,
+                                "state": session.game.state,
+                                "your_turn": session.is_players_turn(p_id),
+                                "your_sign": session.get_players_sign(p_id).value,
+                                "game_over": session.game.game_over,
+                                "winner": session.game.winner.value,
+                                "active_players": [
+                                    {"name": p.name, "sign": p.sign.value}
+                                    for p in session.players.values()
+                                    if p.name in session.active_players
+                                ],
+                            }
                         )
                     except asyncio.TimeoutError:
                         await websocket.close(code=1001)
@@ -426,19 +439,19 @@ async def join_session(s_id: UUID, p_id: str):
                 while True:
                     try:
                         await throttler.throttle()
-                        payload = await with_timeout(websocket.receive_json())
+                        payload = await recv_json()
                         if not session.is_players_turn(p_id):
                             raise NotPlayersTurnError()
                         move = GameMoveRequest(**payload)
                         session.game.move(move.row, move.col)
                         ee.emit(SESSION_EVENT)
                     except GameplayException as e:
-                        await with_timeout(websocket.send_json({"error": str(e)}))
+                        await send_error(e)
 
             await asyncio.gather(sender(), receiver())
 
     except GameException as e:
-        await with_timeout(websocket.send_json({"error": str(e)}))
+        await send_error(e)
     except Exception as e:
         logger.error(e)
         ee.emit(SESSION_EVENT)
