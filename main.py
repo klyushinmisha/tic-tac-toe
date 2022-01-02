@@ -7,11 +7,11 @@ from asyncio import Task
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
-from http import HTTPStatus
 from logging import Logger
 from typing import Optional
 from uuid import UUID
 
+import regex
 from pydantic import BaseModel
 from quart import Quart, websocket
 from quart_cors import cors
@@ -150,7 +150,7 @@ class AllPlayersAlreadyJoinedException(GameException):
 
 
 class Session:
-    SESSION_TIMEOUT: timedelta = timedelta(minutes=10)
+    SESSION_TIMEOUT: timedelta = timedelta(minutes=1)
 
     id: UUID
     game: TicTacToe
@@ -253,6 +253,7 @@ class SessionManager:
 
     def delete(self, s_id: UUID):
         self.sessions.pop(s_id)
+        ee.off(str(s_id))
 
     def gc(self) -> GCResult:
         result = GCResult()
@@ -262,7 +263,6 @@ class SessionManager:
                 gc_ids.add(session.id)
         for s_id in gc_ids:
             self.delete(s_id)
-            ee.off(str(s_id))
             result.sessions.append(s_id)
         return result
 
@@ -272,7 +272,7 @@ class SessionGC:
     gc_interval: timedelta
     logger: Logger = logging.getLogger("SessionGC")
 
-    def __init__(self, gc_interval: timedelta = timedelta(minutes=10)):
+    def __init__(self, gc_interval: timedelta = timedelta(seconds=10)):
         self.gc_task = None
         self.gc_interval = gc_interval
         self.logger.setLevel(logging.INFO)
@@ -318,67 +318,16 @@ async def shutdown():
     session_gc.stop()
 
 
-class PlayerResponse(BaseModel):
-    name: str
-    sign: str
-
-
-class SessionResponse(BaseModel):
-    id: UUID
-    players: list[PlayerResponse]
-    game_over: bool
-    winner: Optional[str]
-
-
 @app.post("/sessions")
 async def create_session():
     session = sm.create()
 
-    return SessionResponse(
-        id=session.id,
-        players=list(
-            PlayerResponse(name=p.name, sign=p.sign.value)
-            for p in session.players.values()
-        ),
-        game_over=session.game.game_over,
-        winner=session.winner,
-    ).dict()
-
-
-@app.get("/sessions/<uuid:s_id>")
-async def get_session(s_id: UUID):
-    try:
-        session = sm.get(s_id)
-    except SessionNotFoundError:
-        return f"Session {s_id!r} not found", HTTPStatus.NOT_FOUND
-
-    return SessionResponse(
-        id=session.id,
-        players=list(
-            PlayerResponse(name=p.name, sign=p.sign.value)
-            for p in session.players.values()
-        ),
-        game_over=session.game.game_over,
-        winner=session.winner,
-    ).dict()
+    return {"id": str(session.id)}
 
 
 class GameMoveRequest(BaseModel):
     row: int
     col: int
-
-
-class GameMoveResultResponse(BaseModel):
-    state: list[list[Optional[str]]]
-    your_turn: bool
-    your_sign: str
-    game_over: bool
-    winner: Optional[str]
-    active_players: list[PlayerResponse]
-
-
-class GameErrorResponse(BaseModel):
-    error: str
 
 
 async def with_timeout(
@@ -414,12 +363,34 @@ class EventEmitter:
 ee = EventEmitter()
 
 
+class Throttler:
+    next: datetime
+    throttle_dt: timedelta
+
+    def __init__(self, throttle_dt: timedelta = timedelta(milliseconds=100)):
+        self.next = datetime.now()
+        self.throttle_dt = throttle_dt
+
+    async def throttle(self):
+        sleep_dt = max(self.next - datetime.now(), timedelta())
+        await asyncio.sleep(sleep_dt.seconds)
+        self.next = datetime.now() + self.throttle_dt
+
+
+player_name_regex: typing.Final[regex.Regex] = regex.compile(r"\w{1,10}")
+
+
 @app.websocket("/sessions/<uuid:s_id>/players/<p_id>/join")
 async def join_session(s_id: UUID, p_id: str):
     SESSION_EVENT: typing.Final[str] = str(s_id)
 
     try:
         session = sm.get(s_id)
+
+        if not player_name_regex.match(p_id):
+            await with_timeout(
+                websocket.send_json({"error": "Invalid player name format"})
+            )
 
         with session.activate_player(p_id):
             chan = ee.on(SESSION_EVENT)
@@ -451,8 +422,10 @@ async def join_session(s_id: UUID, p_id: str):
                         await websocket.close(code=1001)
 
             async def receiver():
+                throttler = Throttler()
                 while True:
                     try:
+                        await throttler.throttle()
                         payload = await with_timeout(websocket.receive_json())
                         if not session.is_players_turn(p_id):
                             raise NotPlayersTurnError()
