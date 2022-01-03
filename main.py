@@ -16,9 +16,6 @@ from pydantic import BaseModel
 from quart import Quart, websocket
 from quart_cors import cors
 
-logging.basicConfig(level=logging.DEBUG)
-logger = logging.getLogger(__name__)
-
 
 class Sign(enum.Enum):
     NONE = None
@@ -152,6 +149,8 @@ class AllPlayersAlreadyJoinedException(GameException):
 class Session:
     SESSION_TIMEOUT: timedelta = timedelta(minutes=1)
 
+    logger: Logger = logging.getLogger("Session")
+
     id: UUID
     game: TicTacToe
     active_players: set[str]
@@ -204,10 +203,10 @@ class Session:
         if online:
             if name in self.active_players:
                 raise PlayerAlreadyJoinedException(name)
-            logger.debug(f"Adding {name!r}")
+            self.logger.debug(f"Adding {name!r}")
             self.active_players.add(name)
         else:
-            logger.debug(f"Removing {name!r}")
+            self.logger.debug(f"Removing {name!r}")
             self.active_players.remove(name)
 
     def get_players_sign(self, name: str) -> Sign:
@@ -267,14 +266,17 @@ class SessionManager:
 
 
 class SessionGC:
+    sm: SessionManager
     gc_task: Optional[Task]
     gc_interval: timedelta
     logger: Logger = logging.getLogger("SessionGC")
 
-    def __init__(self, gc_interval: timedelta = timedelta(seconds=10)):
+    def __init__(
+        self, sm: SessionManager, gc_interval: timedelta = timedelta(seconds=10)
+    ):
+        self.sm = sm
         self.gc_task = None
         self.gc_interval = gc_interval
-        self.logger.setLevel(logging.INFO)
 
     def start(self):
         self.gc_task = asyncio.create_task(self.run_gc())
@@ -292,47 +294,8 @@ class SessionGC:
             await asyncio.sleep(sleep_dur.seconds)
             self.logger.debug(f"Awake. Running a GC cycle")
             next_gc = datetime.now() + self.gc_interval
-            res = sm.gc()
+            res = self.sm.gc()
             self.logger.info(res)
-
-
-sm = SessionManager()
-session_gc = SessionGC()
-
-ALLOWED_ORIGINS: typing.Final[list[str]] = [
-    "http://localhost:3000",
-]
-
-app = Quart(__name__)
-app = cors(app, allow_origin=ALLOWED_ORIGINS)
-
-
-@app.before_serving
-async def startup():
-    session_gc.start()
-
-
-@app.after_serving
-async def shutdown():
-    session_gc.stop()
-
-
-@app.post("/sessions")
-async def create_session():
-    session = sm.create()
-
-    return {"id": str(session.id)}
-
-
-class GameMoveRequest(BaseModel):
-    row: int
-    col: int
-
-
-async def with_timeout(
-    coro: typing.Coroutine, timeout: timedelta = timedelta(minutes=10)
-):
-    return await asyncio.wait_for(coro, float(timeout.seconds))
 
 
 class EventEmitter:
@@ -340,7 +303,6 @@ class EventEmitter:
     channels: dict[str, set[asyncio.Queue]]
 
     def __init__(self):
-        self.logger.setLevel(logging.DEBUG)
         self.channels = {}
 
     @contextmanager
@@ -369,7 +331,50 @@ class EventEmitter:
         self.logger.debug(f"Event {e!r} was emitted")
 
 
-ee = EventEmitter()
+def create_app():
+    ALLOWED_ORIGINS: typing.Final[list[str]] = [
+        "http://localhost:3000",
+    ]
+
+    logging.basicConfig(level=logging.DEBUG)
+
+    app = Quart(__name__)
+    app = cors(app, allow_origin=ALLOWED_ORIGINS)
+    app.sm = SessionManager()
+    app.ee = EventEmitter()
+
+    session_gc = SessionGC(app.sm)
+
+    @app.before_serving
+    async def startup():
+        session_gc.start()
+
+    @app.after_serving
+    async def shutdown():
+        session_gc.stop()
+
+    return app
+
+
+app = create_app()
+
+
+@app.post("/sessions")
+async def create_session():
+    session = app.sm.create()
+
+    return {"id": str(session.id)}
+
+
+class GameMoveRequest(BaseModel):
+    row: int
+    col: int
+
+
+async def with_timeout(
+    coro: typing.Coroutine, timeout: timedelta = timedelta(minutes=10)
+):
+    return await asyncio.wait_for(coro, float(timeout.seconds))
 
 
 class Throttler:
@@ -403,19 +408,19 @@ async def join_session(s_id: UUID, p_id: str):
         return await with_timeout(websocket.receive_json())
 
     try:
-        session = sm.get(s_id)
+        session = app.sm.get(s_id)
 
         if not player_name_regex.match(p_id):
             await send_json({"error": "Invalid player name format"})
             return
 
-        with session.activate_player(p_id), ee.subscription(SESSION_EVENT) as chan:
-            ee.emit(SESSION_EVENT)
+        with session.activate_player(p_id), app.ee.subscription(SESSION_EVENT) as chan:
+            app.ee.emit(SESSION_EVENT)
 
             async def sender():
                 async for _ in chan:
                     try:
-                        logger.debug(f"Sending data to player {p_id!r}")
+                        app.logger.debug(f"Sending data to player {p_id!r}")
                         await send_json(
                             {
                                 "you": p_id,
@@ -444,7 +449,7 @@ async def join_session(s_id: UUID, p_id: str):
                             raise NotPlayersTurnError()
                         move = GameMoveRequest(**payload)
                         session.game.move(move.row, move.col)
-                        ee.emit(SESSION_EVENT)
+                        app.ee.emit(SESSION_EVENT)
                     except GameplayException as e:
                         await send_error(e)
 
@@ -453,6 +458,6 @@ async def join_session(s_id: UUID, p_id: str):
     except GameException as e:
         await send_error(e)
     except Exception as e:
-        logger.error(e)
-        ee.emit(SESSION_EVENT)
+        app.logger.error(e)
+        app.ee.emit(SESSION_EVENT)
         await websocket.close(code=1001)
