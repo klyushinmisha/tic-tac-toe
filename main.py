@@ -7,13 +7,15 @@ from asyncio import Task
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
+from http import HTTPStatus
+from json import JSONDecodeError
 from logging import Logger
 from typing import Optional
 from uuid import UUID
 
 import regex
-from pydantic import BaseModel
-from quart import Quart, websocket
+from pydantic import BaseModel, ValidationError, parse_raw_as
+from quart import Quart, request, websocket
 from quart_cors import cors
 
 
@@ -31,20 +33,16 @@ def next_turn(turn: Sign) -> Sign:
     raise ValueError(f"Unexpected turn value: {turn!r}")
 
 
-class GameException(Exception):
+class GameplayError(Exception):
     pass
 
 
-class GameplayException(Exception):
-    pass
-
-
-class UsedFieldError(GameplayException):
+class UsedFieldError(GameplayError):
     def __init__(self, row: int, col: int):
         super().__init__(f"Field (row={row};col={col}) is used")
 
 
-class NotPlayersTurnError(GameplayException):
+class NotPlayersTurnError(GameplayError):
     def __init__(self):
         super().__init__("Wait for second player's move")
 
@@ -53,8 +51,8 @@ class TicTacToe:
     board: list[list[Sign]]
     turn: Sign
 
-    def __init__(self, n=3):
-        self.board = [[Sign.NONE for _ in range(n)] for _ in range(n)]
+    def __init__(self, field=3):
+        self.board = [[Sign.NONE for _ in range(field)] for _ in range(field)]
         self.turn = Sign.CROSS
 
     def move(self, row: int, col: int):
@@ -136,18 +134,22 @@ class Player:
     sign: Sign
 
 
-class PlayerAlreadyJoinedException(GameException):
+class SessionException(Exception):
+    pass
+
+
+class PlayerAlreadyJoinedException(SessionException):
     def __init__(self, p_id: str):
         super().__init__(f"The player {p_id!r} has already joined the session")
 
 
-class AllPlayersAlreadyJoinedException(GameException):
+class AllPlayersAlreadyJoinedException(SessionException):
     def __init__(self):
         super().__init__("All players have already joined the session")
 
 
 class Session:
-    SESSION_TIMEOUT: timedelta = timedelta(minutes=1)
+    SESSION_TIMEOUT: timedelta = timedelta(minutes=10)
 
     logger: Logger = logging.getLogger("Session")
 
@@ -158,9 +160,9 @@ class Session:
     released_at: datetime
     sign: Sign
 
-    def __init__(self):
+    def __init__(self, field: int):
         self.id = uuid.uuid4()
-        self.game = TicTacToe()
+        self.game = TicTacToe(field)
         self.active_players = set()
         self.players = {}
         self.released_at = datetime.now()
@@ -216,7 +218,7 @@ class Session:
         return self.game.turn == self.get_players_sign(name)
 
 
-class SessionNotFoundError(GameException):
+class SessionNotFoundError(SessionException):
     def __init__(self, s_id: UUID):
         super().__init__(f"Session {s_id} is not found")
 
@@ -239,8 +241,8 @@ class SessionManager:
     def __init__(self):
         self.sessions = {}
 
-    def create(self) -> Session:
-        session = Session()
+    def create(self, field: int) -> Session:
+        session = Session(field)
         self.sessions[session.id] = session
         return session
 
@@ -272,7 +274,7 @@ class SessionGC:
     logger: Logger = logging.getLogger("SessionGC")
 
     def __init__(
-        self, sm: SessionManager, gc_interval: timedelta = timedelta(seconds=10)
+        self, sm: SessionManager, gc_interval: timedelta = timedelta(minutes=5)
     ):
         self.sm = sm
         self.gc_task = None
@@ -359,9 +361,20 @@ def create_app():
 app = create_app()
 
 
+class CreateSessionRequest(BaseModel):
+    field: int
+
+
 @app.post("/sessions")
 async def create_session():
-    session = app.sm.create()
+    try:
+        payload = parse_raw_as(CreateSessionRequest, await request.data)
+    except JSONDecodeError:
+        return {"error": "Invalid JSON structure"}, HTTPStatus.BAD_REQUEST
+    except ValidationError:
+        return {"error": "Invalid body"}, HTTPStatus.BAD_REQUEST
+
+    session = app.sm.create(payload.field)
 
     return {"id": str(session.id)}
 
@@ -372,7 +385,7 @@ class GameMoveRequest(BaseModel):
 
 
 async def with_timeout(
-    coro: typing.Coroutine, timeout: timedelta = timedelta(minutes=10)
+    coro: typing.Coroutine, timeout: timedelta = timedelta(minutes=1)
 ):
     return await asyncio.wait_for(coro, float(timeout.seconds))
 
@@ -402,7 +415,7 @@ async def join_session(s_id: UUID, p_id: str):
         await with_timeout(websocket.send_json(payload))
 
     async def send_error(e: Exception):
-        await send_json(str(e))
+        await send_json({"error": str(e)})
 
     async def recv_json():
         return await with_timeout(websocket.receive_json())
@@ -450,12 +463,12 @@ async def join_session(s_id: UUID, p_id: str):
                         move = GameMoveRequest(**payload)
                         session.game.move(move.row, move.col)
                         app.ee.emit(SESSION_EVENT)
-                    except GameplayException as e:
+                    except GameplayError as e:
                         await send_error(e)
 
             await asyncio.gather(sender(), receiver())
 
-    except GameException as e:
+    except SessionException as e:
         await send_error(e)
     except Exception as e:
         app.logger.error(e)
