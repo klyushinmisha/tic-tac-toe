@@ -6,10 +6,8 @@ import {
   useToast,
 } from '@chakra-ui/react'
 import React, { useCallback, useState } from 'react'
-import { useWebSocketClient } from '../hooks/useWebSocketClient'
-import { useUILocker } from '../hooks/useUILocker'
-import { Board } from '../components/Board'
-import { GameModal } from '../components/Modal'
+import { useWebSocketClient, useUILocker } from '../hooks'
+import { Board, GameModal } from '../components'
 
 function GameSessionContainer({ sessionId, playerId }) {
   const [state, setState] = useState(null)

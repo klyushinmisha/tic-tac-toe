@@ -1,8 +1,7 @@
 import { useToast } from '@chakra-ui/react'
 import React, { useState } from 'react'
-import { useTicTacToeClient } from '../hooks/useTicTacToeClient'
-import { useUILocker } from '../hooks/useUILocker'
-import { CreatedSessionLink, CreateSessionForm } from '../components/Session'
+import { useTicTacToeClient, useUILocker } from '../hooks'
+import { CreatedSessionLink, CreateSessionForm } from '../components'
 
 function NewSessionContainer() {
   const [session, setSession] = useState(null)

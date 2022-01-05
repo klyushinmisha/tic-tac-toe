@@ -1,8 +1,7 @@
 import './App.css'
 import React from 'react'
 import { BrowserRouter, Routes, Route } from 'react-router-dom'
-import { NewSessionContainer } from './containers/NewSessionContainer'
-import { ActiveSessionContainer } from './containers/ActiveSessionContainer'
+import { NewSessionContainer, ActiveSessionContainer } from './containers'
 
 function App() {
   // TODO: add default route

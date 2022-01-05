@@ -1,7 +1,7 @@
 import React, { useState } from 'react'
 import { useParams } from 'react-router-dom'
 import { GameSessionContainer } from './GameSessionContainer'
-import { PlayerJoinForm } from '../components/PlayerJoinForm'
+import { PlayerJoinForm } from '../components'
 
 function ActiveSessionContainer() {
   const [playerId, setPlayerId] = useState(null)
