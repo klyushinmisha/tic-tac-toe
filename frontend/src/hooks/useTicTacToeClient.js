@@ -8,10 +8,8 @@ class TicTacToeClientError extends Error {
 }
 
 class TicTacToeClient {
-  constructor() {
-    const API_VERSION = ''
-
-    this.apiPrefix = SERVER_URL + API_VERSION
+  constructor(apiVersion = '') {
+    this.apiPrefix = SERVER_URL + apiVersion
   }
 
   async createSession(field) {
